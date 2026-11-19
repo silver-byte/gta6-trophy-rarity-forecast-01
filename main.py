@@ -134,6 +134,28 @@ def structural_medians(case, end_index, target_seconds):
         players = finite_number(read.get("players_tracked"), 0.0)
         if players > 0.0:
             player_series.append((times[read_index], math.log(players), players))
+    unique_players = {item[2] for item in player_series}
+    if player_series and len(unique_players) == 1:
+        first_hours = max(0.0, (player_series[0][0] - ORIGIN) / 3600.0)
+        target_hours = max(first_hours, (target_seconds - ORIGIN) / 3600.0)
+        player_multiplier = min(12.0, ((1.0 + target_hours) / (1.0 + first_hours)) ** 1.1)
+        medians = []
+        for trophy_index in range(len(trophies)):
+            last_rate = None
+            for read in reversed(history):
+                rates = read.get("rates") if isinstance(read.get("rates"), list) else []
+                if trophy_index < len(rates) and rates[trophy_index] is not None:
+                    last_rate = clamp_rate(rates[trophy_index])
+                    break
+            if last_rate is None:
+                medians.append(logit(0.01))
+                continue
+            elasticity = 1.0 if last_rate >= 99.0 else 0.22 + 0.72 * math.sqrt(last_rate / 100.0)
+            projected_rate = clamp_rate(last_rate * player_multiplier ** (elasticity - 1.0))
+            last_value = logit(last_rate)
+            move = logit(projected_rate) - last_value
+            medians.append(last_value + min(2.2, max(-2.2, move)))
+        return medians
     player_slope, player_intercept, _ = weighted_line(player_series)
     target_x = time_axis(target_seconds)
     if player_series:
@@ -222,7 +244,7 @@ def model_medians(case, end_index, target_seconds, mode="direct"):
         persistence_blend = 1.0 / (1.0 + 0.75 * horizon_hours / observed_hours)
         move = persistence_blend * (fitted_target - last_value)
         medians.append(last_value + min(0.85, max(-0.85, move)))
-    if mode == "structural" and not global_frozen:
+    if mode == "structural":
         medians = structural_medians(case, end_index, target_seconds)
     return medians, global_frozen
 
@@ -260,6 +282,8 @@ def model_weights(case, times, requested_hours):
     trophy_count = len(trophies)
     players = {finite_number(read.get("players_tracked"), -1.0) for read in history}
     if len(players) < 3:
+        if history and requested_hours >= 1.0 and any(value > 0.0 for value in players):
+            return [0.4] * trophy_count
         return [0.0] * trophy_count
     direct_errors = [[] for _ in range(trophy_count)]
     structural_errors = [[] for _ in range(trophy_count)]
@@ -347,6 +371,71 @@ def calibrated_spread(case, target_seconds, last_seconds, globally_frozen, weigh
     return min(spread_cap, learned_spread), bias
 
 
+def refresh_spreads(case, target_seconds):
+    trophies = case.get("trophies") if isinstance(case.get("trophies"), list) else []
+    history = case.get("history") if isinstance(case.get("history"), list) else []
+    if not trophies:
+        return []
+    times = read_times(history)
+    refreshes = []
+    has_plateaus = False
+    for index in range(1, len(history)):
+        previous = finite_number(history[index - 1].get("players_tracked"), -1.0)
+        current = finite_number(history[index].get("players_tracked"), -1.0)
+        if previous > 0.0 and current > 0.0 and current != previous:
+            refreshes.append(index)
+        elif previous > 0.0 and current == previous:
+            has_plateaus = True
+    last_seconds = times[-1] if times else (timestamp(case.get("at")) or ORIGIN)
+    horizon_hours = max(0.0, (target_seconds - last_seconds) / 3600.0)
+    if refreshes:
+        if len(refreshes) >= 2:
+            intervals = [(times[right] - times[left]) / 3600.0 for left, right in zip(refreshes, refreshes[1:])]
+            interval_hours = max(1.0 / 6.0, percentile(intervals, 0.5))
+        else:
+            span_hours = max(1.0 / 6.0, (times[-1] - times[0]) / 3600.0)
+            interval_hours = span_hours
+        expected_refreshes = min(64.0, horizon_hours / interval_hours)
+        if not has_plateaus:
+            expected_refreshes = 0.0
+    else:
+        expected_refreshes = 0.0 if horizon_hours < 1.0 else min(8.0, max(1.0, horizon_hours / 2.0))
+    jump_samples = [[] for _ in trophies]
+    for read_index in refreshes:
+        before = history[read_index - 1].get("rates")
+        after = history[read_index].get("rates")
+        before = before if isinstance(before, list) else []
+        after = after if isinstance(after, list) else []
+        for trophy_index in range(min(len(trophies), len(before), len(after))):
+            if before[trophy_index] is not None and after[trophy_index] is not None:
+                jump_samples[trophy_index].append(logit(after[trophy_index]) - logit(before[trophy_index]))
+    observed_rms = [math.sqrt(sum(value * value for value in samples) / len(samples))
+                    if samples else 0.0 for samples in jump_samples]
+    pooled_rms = percentile([value for value in observed_rms if value > 0.0], 0.5)
+    spreads = []
+    for trophy_index in range(len(trophies)):
+        last_rate = 0.01
+        last_players = 0.0
+        for read in reversed(history):
+            rates = read.get("rates") if isinstance(read.get("rates"), list) else []
+            players = finite_number(read.get("players_tracked"), 0.0)
+            if trophy_index < len(rates) and rates[trophy_index] is not None and players > 0.0:
+                last_rate = clamp_rate(rates[trophy_index])
+                last_players = players
+                break
+        earners = max(0.5, last_players * last_rate / 100.0)
+        count_variance = 1.0 / earners + (1.0 / last_players if last_players else 1.0)
+        # The target pool is normally larger, so its contribution is smaller
+        # than the checkpoint's while both endpoints remain represented.
+        count_noise = min(1.2, math.sqrt(1.25 * count_variance))
+        if refreshes:
+            per_refresh = max(0.03, 0.7 * observed_rms[trophy_index] + 0.3 * pooled_rms)
+        else:
+            per_refresh = 0.3 + 0.3 / math.sqrt(max(1.0, earners))
+        spreads.append(math.sqrt(expected_refreshes * per_refresh * per_refresh + count_noise * count_noise))
+    return spreads
+
+
 def forecast_case(case):
     trophies = case.get("trophies")
     trophies = trophies if isinstance(trophies, list) else []
@@ -365,6 +454,7 @@ def forecast_case(case):
     if len(medians) < len(trophies):
         medians.extend([logit(0.01)] * (len(trophies) - len(medians)))
     spread, bias = calibrated_spread(case, target_seconds, last_seconds, globally_frozen, weights)
+    jump_spreads = refresh_spreads(case, target_seconds)
     rows = []
     for index, trophy in enumerate(trophies):
         last_value = None
@@ -374,8 +464,10 @@ def forecast_case(case):
                 last_value = logit(rates[index])
                 break
         last_value = last_value if last_value is not None else logit(0.01)
-        center = min(last_value + 0.85, max(last_value - 0.85, medians[index] + bias))
-        quantiles = [round4(logistic(center + z * spread)) for z in Z]
+        move_cap = 2.2 if globally_frozen else 0.85
+        center = min(last_value + move_cap, max(last_value - move_cap, medians[index] + bias))
+        trophy_spread = math.sqrt(spread * spread + (jump_spreads[index] if index < len(jump_spreads) else 0.0) ** 2)
+        quantiles = [round4(logistic(center + z * trophy_spread)) for z in Z]
         quantiles = [max(quantiles[position], quantiles[position - 1]) if position else quantiles[position] for position in range(5)]
         rows.append({"id": trophy.get("id", index + 1), "q": quantiles})
     return {"trophies": rows}
