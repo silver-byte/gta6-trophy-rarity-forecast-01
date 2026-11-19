@@ -223,17 +223,7 @@ def model_medians(case, end_index, target_seconds, mode="direct"):
         move = persistence_blend * (fitted_target - last_value)
         medians.append(last_value + min(0.85, max(-0.85, move)))
     if mode == "structural" and not global_frozen:
-        structural = structural_medians(case, end_index, target_seconds)
-        conservative = []
-        for direct_value, structural_value, observations in zip(medians, structural, series):
-            last_value = observations[-1][1] if observations else logit(0.01)
-            direct_move = direct_value - last_value
-            structural_move = structural_value - last_value
-            if direct_move * structural_move <= 0.0 or abs(structural_move) > abs(direct_move) + 0.12:
-                conservative.append(direct_value)
-            else:
-                conservative.append(structural_value)
-        medians = conservative
+        medians = structural_medians(case, end_index, target_seconds)
     return medians, global_frozen
 
 
@@ -259,14 +249,22 @@ def calibration_pairs(times, requested_horizon_hours):
     return sorted(pairs)
 
 
-def choose_model(case, times, requested_hours):
+def blend_predictions(direct, structural, weights):
+    return [direct_value + weight * (structural_value - direct_value)
+            for direct_value, structural_value, weight in zip(direct, structural, weights)]
+
+
+def model_weights(case, times, requested_hours):
     history = case.get("history") if isinstance(case.get("history"), list) else []
+    trophies = case.get("trophies") if isinstance(case.get("trophies"), list) else []
+    trophy_count = len(trophies)
     players = {finite_number(read.get("players_tracked"), -1.0) for read in history}
     if len(players) < 3:
-        return "direct"
-    direct_errors = []
-    structural_errors = []
-    for cutoff, answer_index in calibration_pairs(times, requested_hours):
+        return [0.0] * trophy_count
+    direct_errors = [[] for _ in range(trophy_count)]
+    structural_errors = [[] for _ in range(trophy_count)]
+    pairs = calibration_pairs(times, requested_hours)
+    for cutoff, answer_index in pairs:
         direct, _ = model_medians(case, cutoff, times[answer_index], "direct")
         structural, _ = model_medians(case, cutoff, times[answer_index], "structural")
         rates = history[answer_index].get("rates")
@@ -277,14 +275,32 @@ def choose_model(case, times, requested_hours):
             actual = finite_number(rates[index], math.nan)
             if math.isfinite(actual):
                 actual_logit = logit(actual)
-                direct_errors.append(abs(actual_logit - direct[index]))
-                structural_errors.append(abs(actual_logit - structural[index]))
-    if len(direct_errors) >= 30 and sum(structural_errors) < 0.97 * sum(direct_errors):
-        return "structural"
-    return "direct"
+                direct_errors[index].append(abs(actual_logit - direct[index]))
+                structural_errors[index].append(abs(actual_logit - structural[index]))
+    all_direct = [error for errors in direct_errors for error in errors]
+    all_structural = [error for errors in structural_errors for error in errors]
+    if len(all_direct) < 30:
+        return [0.0] * trophy_count
+    global_direct = sum(all_direct) / len(all_direct)
+    global_structural = sum(all_structural) / len(all_structural)
+    global_weight = (global_direct + 0.03) / (global_direct + global_structural + 0.06)
+    validated_hours = max((times[answer] - times[cutoff]) / 3600.0 for cutoff, answer in pairs)
+    horizon_ratio = min(1.0, validated_hours / max(validated_hours, requested_hours))
+    horizon_support = horizon_ratio * horizon_ratio
+    weights = []
+    for own_direct, own_structural in zip(direct_errors, structural_errors):
+        if len(own_direct) < 4:
+            weights.append(global_weight * horizon_support)
+            continue
+        direct_error = sum(own_direct) / len(own_direct)
+        structural_error = sum(own_structural) / len(own_structural)
+        own_weight = (direct_error + 0.03) / (direct_error + structural_error + 0.06)
+        weight = 0.65 * own_weight + 0.35 * global_weight
+        weights.append(min(0.9, max(0.1, weight)) * horizon_support)
+    return weights
 
 
-def calibrated_spread(case, target_seconds, last_seconds, globally_frozen, mode):
+def calibrated_spread(case, target_seconds, last_seconds, globally_frozen, weights):
     horizon_days = max(0.0, (target_seconds - last_seconds) / 86400.0)
     base = 0.5 * math.sqrt(horizon_days)
     if globally_frozen:
@@ -295,7 +311,9 @@ def calibrated_spread(case, target_seconds, last_seconds, globally_frozen, mode)
     scaled_errors = []
     signed_errors = []
     for cutoff, answer_index in calibration_pairs(times, requested_hours):
-        predicted, _ = model_medians(case, cutoff, times[answer_index], mode)
+        direct, _ = model_medians(case, cutoff, times[answer_index], "direct")
+        structural, _ = model_medians(case, cutoff, times[answer_index], "structural")
+        predicted = blend_predictions(direct, structural, weights)
         rates = history[answer_index].get("rates")
         rates = rates if isinstance(rates, list) else []
         days = max(1.0 / 144.0, (times[answer_index] - times[cutoff]) / 86400.0)
@@ -312,6 +330,9 @@ def calibrated_spread(case, target_seconds, last_seconds, globally_frozen, mode)
         normal_scale = percentile(scaled_errors, 0.68)
         robust_scale = percentile(scaled_errors, 0.5) / 0.674
         unit_scale = 0.65 * normal_scale + 0.35 * robust_scale
+        observed_coverage = sum(error <= 1.645 * unit_scale for error in scaled_errors) / len(scaled_errors)
+        if abs(observed_coverage - 0.95) > 0.005:
+            unit_scale = percentile(scaled_errors, 0.95) / 1.645
         unit_scale = min(1.8, max(0.5, unit_scale))
     # Repeated one-sided misses indicate bias, but extrapolating that bias is risky.
     if len(signed_errors) >= 20:
@@ -337,11 +358,13 @@ def forecast_case(case):
     target_seconds = timestamp(case.get("target")) or ((timestamp(case.get("at")) or last_seconds) + horizon_minutes * 60.0)
     target_seconds = max(last_seconds, target_seconds)
     requested_hours = max(0.0, (target_seconds - last_seconds) / 3600.0)
-    mode = choose_model(case, times, requested_hours)
-    medians, globally_frozen = model_medians(case, len(history) - 1, target_seconds, mode)
+    weights = model_weights(case, times, requested_hours)
+    direct, globally_frozen = model_medians(case, len(history) - 1, target_seconds, "direct")
+    structural, _ = model_medians(case, len(history) - 1, target_seconds, "structural")
+    medians = blend_predictions(direct, structural, weights)
     if len(medians) < len(trophies):
         medians.extend([logit(0.01)] * (len(trophies) - len(medians)))
-    spread, bias = calibrated_spread(case, target_seconds, last_seconds, globally_frozen, mode)
+    spread, bias = calibrated_spread(case, target_seconds, last_seconds, globally_frozen, weights)
     rows = []
     for index, trophy in enumerate(trophies):
         last_value = None
