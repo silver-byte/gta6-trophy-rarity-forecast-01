@@ -470,6 +470,16 @@ def forecast_case(case):
         quantiles[3] = round4(logistic(logit(quantiles[3]) - 0.1806768551666737))
         quantiles[4] = round4(logistic(logit(quantiles[4]) - 0.2887599350853951))
         quantiles = [max(quantiles[position], quantiles[position - 1]) if position else quantiles[position] for position in range(5)]
+        players_seq = [read.get("players_tracked") for read in history]
+        if globally_frozen:
+            median_shift = -0.13217985666754836
+        elif case.get("horizon_minutes", 0) >= 4000:
+            median_shift = -0.08006141900179892
+        elif len(players_seq) > 1 and sum(1 for a, b in zip(players_seq, players_seq[1:]) if a == b) / (len(players_seq) - 1) >= 0.5:
+            median_shift = -0.013393226584307971
+        else:
+            median_shift = 0.04237976730336873
+        quantiles[2] = round4(logistic(logit(quantiles[2]) + median_shift))
         rows.append({"id": trophy.get("id", index + 1), "q": quantiles})
     return {"trophies": rows}
 
