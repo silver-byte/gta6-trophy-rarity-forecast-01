@@ -107,7 +107,7 @@ def weighted_line(observations):
     newest = observations[-1][0]
     oldest = observations[0][0]
     span_hours = max(1.0, (newest - oldest) / 3600.0)
-    half_life = min(24.0, max(4.0, span_hours * 0.15))
+    half_life = min(24.0, max(0.75, span_hours * 0.03))
     points = []
     for seconds, value, _ in observations:
         age_hours = max(0.0, (newest - seconds) / 3600.0)
@@ -357,7 +357,7 @@ def calibrated_spread(case, target_seconds, last_seconds, globally_frozen, weigh
         observed_coverage = sum(error <= 1.645 * unit_scale for error in scaled_errors) / len(scaled_errors)
         if abs(observed_coverage - 0.95) > 0.005:
             unit_scale = percentile(scaled_errors, 0.95) / 1.645
-        unit_scale = min(1.0, max(0.5, unit_scale))
+        unit_scale = min(1.0, max(0.35, unit_scale))
     # Repeated one-sided misses indicate bias, but extrapolating that bias is risky.
     if len(signed_errors) >= 20:
         unit_bias = percentile(signed_errors, 0.5)
@@ -367,7 +367,7 @@ def calibrated_spread(case, target_seconds, last_seconds, globally_frozen, weigh
     learned_spread = unit_scale * math.sqrt(horizon_days)
     # Early growth backtests are less mature than the final checkpoint; retain
     # their signal without letting that non-stationarity make every band huge.
-    spread_cap = max(0.75, base * 0.65)
+    spread_cap = max(0.60, base * 0.65)
     return min(spread_cap, learned_spread), bias
 
 
