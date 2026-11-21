@@ -327,8 +327,6 @@ def model_weights(case, times, requested_hours):
 def calibrated_spread(case, target_seconds, last_seconds, globally_frozen, weights):
     horizon_days = max(0.0, (target_seconds - last_seconds) / 86400.0)
     base = 0.5 * math.sqrt(horizon_days)
-    if globally_frozen:
-        return max(base * 1.6, 0.8), 0.0
     history = case.get("history") if isinstance(case.get("history"), list) else []
     times = read_times(history)
     requested_hours = max(0.0, (target_seconds - last_seconds) / 3600.0)
