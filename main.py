@@ -467,6 +467,9 @@ def forecast_case(case):
         trophy_spread = math.sqrt(spread * spread + (jump_spreads[index] if index < len(jump_spreads) else 0.0) ** 2)
         quantiles = [round4(logistic(center + z * trophy_spread)) for z in Z]
         quantiles = [max(quantiles[position], quantiles[position - 1]) if position else quantiles[position] for position in range(5)]
+        quantiles[3] = round4(logistic(logit(quantiles[3]) - 0.1806768551666737))
+        quantiles[4] = round4(logistic(logit(quantiles[4]) - 0.2887599350853951))
+        quantiles = [max(quantiles[position], quantiles[position - 1]) if position else quantiles[position] for position in range(5)]
         rows.append({"id": trophy.get("id", index + 1), "q": quantiles})
     return {"trophies": rows}
 
