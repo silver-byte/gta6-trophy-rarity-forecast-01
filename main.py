@@ -480,6 +480,7 @@ def forecast_case(case):
         else:
             median_shift = 0.04237976730336873
         quantiles[2] = round4(logistic(logit(quantiles[2]) + median_shift))
+        quantiles[2] = round4(logistic(logit(quantiles[2]) + median_shift))
         rows.append({"id": trophy.get("id", index + 1), "q": quantiles})
     return {"trophies": rows}
 
